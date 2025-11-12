@@ -43,28 +43,28 @@ else:
 mode = st.sidebar.radio("Search Mode", ["AI Overview (simple)", "AI Mode (complex)"])
 
 # Configure AI provider
-if not api_key:
-    st.error(f"Please enter your {provider} API Key to proceed.")
-    st.stop()
+api_key_missing = not api_key
 
 if provider == "Gemini":
-    genai.configure(api_key=api_key)
     # You can change to a pinned version like "gemini-2.5-pro-exp-0827" if desired.
     model_name = "gemini-2.5-pro"
-    model = genai.GenerativeModel(model_name)
+    model = None
     ai_client = None
+    if not api_key_missing:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(model_name)
 else:  # OpenAI
-    ai_client = openai.OpenAI(api_key=api_key)
     model_name = "gpt-4o"  # Using GPT-4o as default, can be changed
     model = None
+    ai_client = openai.OpenAI(api_key=api_key) if not api_key_missing else None
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("SerpAPI (optional)")
 serpapi_key = st.sidebar.text_input("SerpAPI Key", type="password")
 fetch_serp_results = st.sidebar.checkbox(
-    "Fetch Google results for each fan-out query",
+    "Fetch Google AI Overview for each fan-out query",
     value=False,
-    help="Calls SerpAPI for every generated query to retrieve the top organic Google results."
+    help="Calls SerpAPI's Google AI Overview API for every generated query."
 )
 serpapi_location = st.sidebar.text_input(
     "Location",
@@ -292,202 +292,228 @@ run_tab, analyze_tab = st.tabs(["Run Fan-Out", "Analyze Saved Runs"])
 with run_tab:
     # Run button
     if run_clicked:
-        # Build list of lookup queries
-        if input_mode == "Single query":
-            lookups = [user_query.strip()] if user_query.strip() else []
+        if api_key_missing:
+            st.error(f"Please enter your {provider} API Key to run the fan-out.")
         else:
-            lookups = [q.strip() for q in bulk_text.splitlines() if q.strip()]
+            # Build list of lookup queries
+            if input_mode == "Single query":
+                lookups = [user_query.strip()] if user_query.strip() else []
+            else:
+                lookups = [q.strip() for q in bulk_text.splitlines() if q.strip()]
 
-        if not lookups:
-            st.warning("⚠️ Please provide at least one query.")
-            st.stop()
+            if not lookups:
+                st.warning("⚠️ Please provide at least one query.")
+                st.stop()
 
-        all_rows = []
-        run_summaries = []
-        errors = []
-        raw_outputs = {}
+            all_rows = []
+            run_summaries = []
+            errors = []
+            raw_outputs = {}
 
-        status = st.status("Processing queries…", expanded=True)
-        progress = st.progress(0)
-        total = len(lookups)
+            status = st.status("Processing queries…", expanded=True)
+            progress = st.progress(0)
+            total = len(lookups)
 
-        for i, q in enumerate(lookups, start=1):
-            try:
-                details, expanded, raw = generate_fanout(
-                    q, mode, provider, 
-                    model_instance=model if provider == "Gemini" else None,
-                    openai_client=ai_client if provider == "OpenAI" else None,
-                    openai_model_name=model_name if provider == "OpenAI" else None
-                )
-                raw_outputs[q] = raw
-                run_summaries.append({
-                    "lookup_query": q,
-                    "target_query_count": details.get("target_query_count"),
-                    "reasoning_for_count": details.get("reasoning_for_count", "")
-                })
-                # Flatten rows, prefix with lookup query
-                for obj in expanded:
-                    row = {
+            for i, q in enumerate(lookups, start=1):
+                try:
+                    details, expanded, raw = generate_fanout(
+                        q, mode, provider, 
+                        model_instance=model if provider == "Gemini" else None,
+                        openai_client=ai_client if provider == "OpenAI" else None,
+                        openai_model_name=model_name if provider == "OpenAI" else None
+                    )
+                    raw_outputs[q] = raw
+                    run_summaries.append({
                         "lookup_query": q,
-                        "query": obj.get("query", ""),
-                        "type": obj.get("type", ""),
-                        "user_intent": obj.get("user_intent", ""),
-                        "reasoning": obj.get("reasoning", ""),
-                        "routing_format": obj.get("routing_format", ""),
-                        "format_reason": obj.get("format_reason", "")
+                        "target_query_count": details.get("target_query_count"),
+                        "reasoning_for_count": details.get("reasoning_for_count", "")
+                    })
+                    # Flatten rows, prefix with lookup query
+                    for obj in expanded:
+                        row = {
+                            "lookup_query": q,
+                            "query": obj.get("query", ""),
+                            "type": obj.get("type", ""),
+                            "user_intent": obj.get("user_intent", ""),
+                            "reasoning": obj.get("reasoning", ""),
+                            "routing_format": obj.get("routing_format", ""),
+                            "format_reason": obj.get("format_reason", "")
+                        }
+                        if fetch_serp_results and serpapi_key:
+                            serp_results, serp_error = get_serpapi_results(
+                                row["query"],
+                                serpapi_key,
+                                location=serpapi_location,
+                                google_domain=serpapi_domain,
+                                gl=serpapi_gl,
+                                hl=serpapi_hl
+                            )
+                            row["serpapi_results"] = json.dumps(serp_results, ensure_ascii=False)
+                            row["serpapi_error"] = serp_error
+                        all_rows.append(row)
+                    # Add original lookup row for downstream analysis
+                    original_row = {
+                        "lookup_query": q,
+                        "query": q,
+                        "type": "original_lookup",
+                        "user_intent": "Original lookup query",
+                        "reasoning": "User-entered query before fan-out.",
+                        "routing_format": "",
+                        "format_reason": ""
                     }
                     if fetch_serp_results and serpapi_key:
                         serp_results, serp_error = get_serpapi_results(
-                            row["query"],
+                            q,
                             serpapi_key,
                             location=serpapi_location,
                             google_domain=serpapi_domain,
                             gl=serpapi_gl,
                             hl=serpapi_hl
                         )
-                        row["serpapi_results"] = json.dumps(serp_results, ensure_ascii=False)
-                        row["serpapi_error"] = serp_error
-                    all_rows.append(row)
-                # Add original lookup row for downstream analysis
-                original_row = {
-                    "lookup_query": q,
-                    "query": q,
-                    "type": "original_lookup",
-                    "user_intent": "Original lookup query",
-                    "reasoning": "User-entered query before fan-out.",
-                    "routing_format": "",
-                    "format_reason": ""
-                }
-                if fetch_serp_results and serpapi_key:
-                    serp_results, serp_error = get_serpapi_results(
-                        q,
-                        serpapi_key,
-                        location=serpapi_location,
-                        google_domain=serpapi_domain,
-                        gl=serpapi_gl,
-                        hl=serpapi_hl
+                        original_row["serpapi_results"] = json.dumps(serp_results, ensure_ascii=False)
+                        original_row["serpapi_error"] = serp_error
+                    all_rows.append(original_row)
+                    status.write(f"✅ Processed: **{q}** — generated {len(expanded)} queries.")
+                except json.JSONDecodeError as e:
+                    msg = f"❌ JSON parse failed for '{q}': {e}"
+                    status.write(msg)
+                    errors.append({"lookup_query": q, "error": str(e)})
+                except Exception as e:
+                    msg = f"❌ Error for '{q}': {e}"
+                    status.write(msg)
+                    errors.append({"lookup_query": q, "error": str(e)})
+
+                progress.progress(i / total)
+
+            status.update(label="Complete.", state="complete")
+
+            # Build output DataFrame (lookup_query first)
+            if all_rows:
+                df = pd.DataFrame(all_rows)
+
+                run_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                run_id = f"{run_timestamp.replace(' ', '_').replace(':', '-')}_{len(st.session_state.last_runs) + 1}"
+                df["run_id"] = run_id
+                df["run_timestamp"] = run_timestamp
+                df["provider"] = provider
+                df["mode"] = mode
+                df["input_mode"] = input_mode
+                df["serpapi_enabled"] = fetch_serp_results and bool(serpapi_key)
+                df["serpapi_location"] = serpapi_location
+                df["serpapi_domain"] = serpapi_domain
+                df["serpapi_gl"] = serpapi_gl
+                df["serpapi_hl"] = serpapi_hl
+
+                # Ensure column order (lookup_query first, metadata grouped)
+                preferred_cols = [
+                    "run_id",
+                    "run_timestamp",
+                    "provider",
+                    "mode",
+                    "input_mode",
+                    "lookup_query",
+                    "query",
+                    "type",
+                    "user_intent",
+                    "reasoning",
+                    "routing_format",
+                    "format_reason",
+                    "serpapi_enabled",
+                    "serpapi_location",
+                    "serpapi_domain",
+                    "serpapi_gl",
+                    "serpapi_hl"
+                ]
+                existing = [c for c in preferred_cols if c in df.columns]
+                others = [c for c in df.columns if c not in existing]
+                df = df[existing + others]
+
+                df_display = df.copy()
+                if fetch_serp_results and serpapi_key and "serpapi_results" in df_display.columns:
+                    df_display["serpapi_results"] = df_display["serpapi_results"].fillna("")
+
+                st.subheader("📊 Synthetic Queries (with routing format)")
+                st.dataframe(df_display, use_container_width=True, height=(min(len(df_display), 20) + 1) * 35 + 3)
+
+                csv = df_display.to_csv(index=False).encode("utf-8")
+                csv_name = f"vectra_output_bulk_with_routing_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                st.download_button("📥 Download CSV", data=csv, file_name=csv_name, mime="text/csv")
+
+                st.session_state.last_runs.append({
+                    "timestamp": run_timestamp,
+                    "provider": provider,
+                    "mode": mode,
+                    "input_mode": input_mode,
+                    "lookup_queries": lookups,
+                    "rows": df.to_dict(orient="records"),
+                    "run_summaries": run_summaries,
+                    "errors": errors,
+                    "serpapi_enabled": fetch_serp_results and bool(serpapi_key),
+                    "serpapi_location": serpapi_location,
+                    "serpapi_domain": serpapi_domain,
+                    "serpapi_gl": serpapi_gl,
+                    "serpapi_hl": serpapi_hl,
+                    "raw_outputs": raw_outputs
+                })
+
+                if fetch_serp_results and serpapi_key and "serpapi_results" in df.columns:
+                    st.markdown("---")
+                    st.subheader("🧠 Google AI Overview (SerpAPI)")
+                    selectable_queries = df["query"].tolist()
+                    selected_query = st.selectbox(
+                        "Select a fan-out query to inspect AI Overview",
+                        selectable_queries
                     )
-                    original_row["serpapi_results"] = json.dumps(serp_results, ensure_ascii=False)
-                    original_row["serpapi_error"] = serp_error
-                all_rows.append(original_row)
-                status.write(f"✅ Processed: **{q}** — generated {len(expanded)} queries.")
-            except json.JSONDecodeError as e:
-                msg = f"❌ JSON parse failed for '{q}': {e}"
-                status.write(msg)
-                errors.append({"lookup_query": q, "error": str(e)})
-            except Exception as e:
-                msg = f"❌ Error for '{q}': {e}"
-                status.write(msg)
-                errors.append({"lookup_query": q, "error": str(e)})
+                    selected_series = df[df["query"] == selected_query].iloc[0]
+                    serp_results = selected_series.get("serpapi_results")
+                    if isinstance(serp_results, str) and serp_results.strip():
+                        try:
+                            serp_results = json.loads(serp_results)
+                        except json.JSONDecodeError:
+                            pass
+                    serp_error = selected_series.get("serpapi_error")
 
-            progress.progress(i / total)
+                    if serp_error:
+                        st.warning(f"SerpAPI error for this query: {serp_error}")
 
-        status.update(label="Complete.", state="complete")
+                    overview = None
+                    if isinstance(serp_results, dict):
+                        overview = serp_results.get("ai_overview")
 
-        # Build output DataFrame (lookup_query first)
-        if all_rows:
-            df = pd.DataFrame(all_rows)
+                    if overview:
+                        st.json(overview)
+                        references = overview.get("references")
+                        if isinstance(references, list) and references:
+                            ref_rows = []
+                            for ref in references:
+                                if isinstance(ref, dict):
+                                    ref_rows.append({
+                                        "title": ref.get("title"),
+                                        "link": ref.get("link"),
+                                        "source": ref.get("source"),
+                                        "snippet": ref.get("snippet"),
+                                    })
+                            if ref_rows:
+                                with st.expander("AI Overview References"):
+                                    st.dataframe(pd.DataFrame(ref_rows), use_container_width=True)
+                    else:
+                        st.info("No AI overview available.")
+            else:
+                st.warning("No synthetic queries were generated.")
 
-            # Ensure column order (lookup_query first)
-            preferred_cols = [
-                "lookup_query",
-                "query",
-                "type",
-                "user_intent",
-                "reasoning",
-                "routing_format",
-                "format_reason"
-            ]
-            existing = [c for c in preferred_cols if c in df.columns]
-            others = [c for c in df.columns if c not in existing]
-            df = df[existing + others]
-
-            df_display = df.copy()
-            if fetch_serp_results and serpapi_key and "serpapi_results" in df_display.columns:
-                df_display["serpapi_results"] = df_display["serpapi_results"].fillna("")
-
-            st.subheader("📊 Synthetic Queries (with routing format)")
-            st.dataframe(df_display, use_container_width=True, height=(min(len(df_display), 20) + 1) * 35 + 3)
-
-            csv = df_display.to_csv(index=False).encode("utf-8")
-            csv_name = f"vectra_output_bulk_with_routing_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-            st.download_button("📥 Download CSV", data=csv, file_name=csv_name, mime="text/csv")
-
-            st.session_state.last_runs.append({
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "provider": provider,
-                "mode": mode,
-                "input_mode": input_mode,
-                "lookup_queries": lookups,
-                "rows": df.to_dict(orient="records"),
-                "run_summaries": run_summaries,
-                "errors": errors,
-                "serpapi_enabled": fetch_serp_results and bool(serpapi_key),
-                "serpapi_location": serpapi_location,
-                "serpapi_domain": serpapi_domain,
-                "serpapi_gl": serpapi_gl,
-                "serpapi_hl": serpapi_hl,
-                "raw_outputs": raw_outputs
-            })
-
-            if fetch_serp_results and serpapi_key and "serpapi_results" in df.columns:
+            # Summaries per lookup (optional)
+            if run_summaries:
                 st.markdown("---")
-                st.subheader("🧠 Google AI Overview (SerpAPI)")
-                selectable_queries = df["query"].tolist()
-                selected_query = st.selectbox(
-                    "Select a fan-out query to inspect AI Overview",
-                    selectable_queries
-                )
-                selected_series = df[df["query"] == selected_query].iloc[0]
-                serp_results = selected_series.get("serpapi_results")
-                if isinstance(serp_results, str) and serp_results.strip():
-                    try:
-                        serp_results = json.loads(serp_results)
-                    except json.JSONDecodeError:
-                        pass
-                serp_error = selected_series.get("serpapi_error")
+                st.subheader("🧠 Generation Plans (per lookup)")
+                sum_df = pd.DataFrame(run_summaries)
+                st.dataframe(sum_df, use_container_width=True)
 
-                if serp_error:
-                    st.warning(f"SerpAPI error for this query: {serp_error}")
-
-                overview = None
-                if isinstance(serp_results, dict):
-                    overview = serp_results.get("ai_overview")
-
-                if overview:
-                    st.json(overview)
-                    references = overview.get("references")
-                    if isinstance(references, list) and references:
-                        ref_rows = []
-                        for ref in references:
-                            if isinstance(ref, dict):
-                                ref_rows.append({
-                                    "title": ref.get("title"),
-                                    "link": ref.get("link"),
-                                    "source": ref.get("source"),
-                                    "snippet": ref.get("snippet"),
-                                })
-                        if ref_rows:
-                            with st.expander("AI Overview References"):
-                                st.dataframe(pd.DataFrame(ref_rows), use_container_width=True)
-                else:
-                    st.info("No AI overview available.")
-        else:
-            st.warning("No synthetic queries were generated.")
-
-        # Summaries per lookup (optional)
-        if run_summaries:
-            st.markdown("---")
-            st.subheader("🧠 Generation Plans (per lookup)")
-            sum_df = pd.DataFrame(run_summaries)
-            st.dataframe(sum_df, use_container_width=True)
-
-        # Error table if any
-        if errors:
-            st.markdown("---")
-            st.subheader("⚠️ Errors")
-            err_df = pd.DataFrame(errors)
-            st.dataframe(err_df, use_container_width=True)
+            # Error table if any
+            if errors:
+                st.markdown("---")
+                st.subheader("⚠️ Errors")
+                err_df = pd.DataFrame(errors)
+                st.dataframe(err_df, use_container_width=True)
 
     # Saved runs viewer
     if st.session_state.get('last_runs'):
@@ -542,16 +568,25 @@ with run_tab:
                     st.code(raw_json, language="json")
 
 with analyze_tab:
-    st.markdown("Upload a CSV (e.g., from the saved run downloads) to inspect it without re-running expensive queries.")
-    uploaded_csv = st.file_uploader("Saved run CSV", type=["csv"], key="analysis_uploader")
-    if uploaded_csv is not None:
-        try:
-            analysis_df = pd.read_csv(uploaded_csv)
-        except Exception as exc:
-            st.error(f"Could not read CSV: {exc}")
-            analysis_df = None
+    st.markdown("Upload one or more CSV exports (e.g., Saved Runs) to inspect them without re-running expensive queries.")
+    uploaded_csvs = st.file_uploader(
+        "Saved run CSV files",
+        type=["csv"],
+        key="analysis_uploader",
+        accept_multiple_files=True
+    )
+    analysis_df = None
+    if uploaded_csvs:
+        frames = []
+        for file in uploaded_csvs:
+            try:
+                frames.append(pd.read_csv(file))
+            except Exception as exc:
+                st.error(f"Could not read {file.name}: {exc}")
+        if frames:
+            analysis_df = pd.concat(frames, ignore_index=True)
 
-        if analysis_df is not None:
+    if analysis_df is not None:
             st.success("Saved run loaded.")
             cols = st.columns(3)
             cols[0].metric("Rows", len(analysis_df))
@@ -581,7 +616,10 @@ with analyze_tab:
 
             all_reference_rows = []
             if serp_data is not None and "query" in analysis_df.columns:
-                for idx, query in enumerate(analysis_df["query"].tolist()):
+                query_list = analysis_df["query"].tolist()
+                type_list = analysis_df["type"].tolist() if "type" in analysis_df.columns else [None] * len(query_list)
+                lookup_list = analysis_df["lookup_query"].tolist() if "lookup_query" in analysis_df.columns else [None] * len(query_list)
+                for idx, query in enumerate(query_list):
                     payload = serp_data.iloc[idx]
                     if isinstance(payload, dict):
                         overview = payload.get("ai_overview")
@@ -590,7 +628,9 @@ with analyze_tab:
                             for ref in references:
                                 if isinstance(ref, dict):
                                     all_reference_rows.append({
+                                        "lookup_query": lookup_list[idx],
                                         "query": query,
+                                        "type": type_list[idx],
                                         "title": ref.get("title"),
                                         "link": ref.get("link"),
                                         "source": ref.get("source"),
@@ -600,9 +640,10 @@ with analyze_tab:
             if "query" in analysis_df.columns and serp_data is not None:
                 st.markdown("---")
                 st.subheader("SerpAPI AI Overview from uploaded run")
+                available_queries = analysis_df["query"].tolist()
                 query_choice = st.selectbox(
                     "Pick a fan-out query",
-                    analysis_df["query"].tolist(),
+                    available_queries,
                     key="analysis_query_select"
                 )
                 selected_row = analysis_df[analysis_df["query"] == query_choice].iloc[0]
@@ -635,7 +676,24 @@ with analyze_tab:
             if all_reference_rows:
                 st.markdown("---")
                 st.subheader("AI Overview References (all queries)")
+                filter_options = sorted({row["lookup_query"] for row in all_reference_rows if row.get("type") == "original_lookup" and row.get("lookup_query")})
+                selected_originals = st.multiselect(
+                    "Filter by original query",
+                    filter_options,
+                    default=filter_options,
+                    key="analysis_original_filter"
+                )
                 all_ref_df = pd.DataFrame(all_reference_rows)
+                if selected_originals:
+                    all_ref_df = all_ref_df[all_ref_df["lookup_query"].isin(selected_originals)]
+                original_entries = all_ref_df[all_ref_df["type"] == "original_lookup"] if "type" in all_ref_df.columns else pd.DataFrame()
+                if not original_entries.empty:
+                    originals = sorted({val for val in (original_entries["lookup_query"].dropna().tolist() + original_entries["query"].dropna().tolist()) if val})
+                    if originals:
+                        st.markdown("**Original queries:** " + ", ".join(f"`{q}`" for q in originals))
+                if "type" in all_ref_df.columns and not all_ref_df["type"].isna().all():
+                    all_ref_df["__is_original_lookup"] = all_ref_df["type"] == "original_lookup"
+                    all_ref_df = all_ref_df.sort_values(by="__is_original_lookup", ascending=False).drop(columns="__is_original_lookup")
                 st.dataframe(all_ref_df, use_container_width=True)
                 if "source" in all_ref_df.columns:
                     source_counts = all_ref_df["source"].value_counts().reset_index()
@@ -649,3 +707,17 @@ with analyze_tab:
                 type_counts = analysis_df["type"].value_counts().reset_index()
                 type_counts.columns = ["type", "count"]
                 st.bar_chart(type_counts.set_index("type"))
+                st.subheader("Original query filter for type breakdown")
+                if "lookup_query" in analysis_df.columns:
+                    orig_options = sorted(analysis_df["lookup_query"].dropna().unique().tolist())
+                    selected_origins = st.multiselect(
+                        "Select original queries",
+                        orig_options,
+                        default=orig_options,
+                        key="analysis_type_filter"
+                    )
+                    if selected_origins:
+                        filtered = analysis_df[analysis_df["lookup_query"].isin(selected_origins)]
+                        type_counts_filtered = filtered["type"].value_counts().reset_index()
+                        type_counts_filtered.columns = ["type", "count"]
+                        st.bar_chart(type_counts_filtered.set_index("type"))
