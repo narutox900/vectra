@@ -4,4 +4,5 @@ pandas
 openai
 watchdog
 google-search-results
+gspread
 requests

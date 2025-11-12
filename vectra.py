@@ -1,6 +1,7 @@
 import json
 from datetime import datetime
 import hashlib
+import gspread
 
 import google.generativeai as genai
 import openai
@@ -59,6 +60,7 @@ else:  # OpenAI
     model = None
     ai_client = openai.OpenAI(api_key=api_key) if not api_key_missing else None
 
+# Integrations
 st.sidebar.markdown("---")
 st.sidebar.subheader("SerpAPI (optional)")
 serpapi_key = st.sidebar.text_input("SerpAPI Key", type="password")
@@ -94,6 +96,27 @@ serpapi_hl = st.sidebar.text_input(
 
 if fetch_serp_results and not serpapi_key:
     st.sidebar.warning("Provide a SerpAPI key or disable fetching Google results.")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Google Sheets Sync")
+gs_creds_text = st.sidebar.text_area(
+    "Service Account JSON",
+    height=150,
+    help="Paste the Google service account credentials JSON."
+)
+gs_spreadsheet_id = st.sidebar.text_input(
+    "Spreadsheet ID",
+    help="The Google Sheets ID (the long hash in the sheet URL)."
+)
+gs_refs_sheet = st.sidebar.text_input(
+    "References sheet name",
+    value="ReferencesBySource"
+)
+gs_links_sheet = st.sidebar.text_input(
+    "Links sheet name",
+    value="SourceLinks"
+)
+
 
 # Allowed routing formats (sent to the model)
 ALLOWED_FORMATS = [
@@ -248,23 +271,23 @@ def get_serpapi_results(
         return [], str(exc)
 
 
-def build_reference_key(row):
-    """Create a stable key for reference enrichment storage."""
-    parts = [
-        str(row.get("lookup_query", "")),
-        str(row.get("query", "")),
-        str(row.get("link", "")),
-        str(row.get("title", ""))
-    ]
-    return "||".join(parts)
 
+def sync_to_google_sheets(creds_json, spreadsheet_id, dataframes):
+    creds_dict = json.loads(creds_json)
+    client = gspread.service_account_from_dict(creds_dict)
+    sh = client.open_by_key(spreadsheet_id)
 
-def fetch_reference_contact_info(row):
-    """Placeholder for future Lemlist/contact enrichment."""
-    link = row.get("link") or "unknown link"
-    source = row.get("source") or "unknown source"
-    return f"[Mock] Enrichment placeholder for {source} ({link}) at {datetime.now().isoformat(timespec='seconds')}"
+    existing_sheets = {ws.title: ws for ws in sh.worksheets()}
 
+    for sheet_name, df in dataframes.items():
+        if df is None or df.empty:
+            continue
+        worksheet = existing_sheets.get(sheet_name)
+        if worksheet is None:
+            worksheet = sh.add_worksheet(title=sheet_name, rows=str(len(df) + 10), cols=str(len(df.columns) + 5))
+        worksheet.clear()
+        values = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
+        worksheet.update(values)
 # Single fan-out
 def generate_fanout(query, mode, provider_name, model_instance=None, openai_client=None, openai_model_name=None):
     prompt = QUERY_FANOUT_PROMPT(query, mode)
@@ -305,8 +328,6 @@ def generate_fanout(query, mode, provider_name, model_instance=None, openai_clie
 # Initialize session state
 if 'last_runs' not in st.session_state:
     st.session_state.last_runs = []
-if 'reference_enrichments' not in st.session_state:
-    st.session_state.reference_enrichments = {}
 
 run_tab, analyze_tab = st.tabs(["Run Fan-Out", "Analyze Saved Runs"])
 
@@ -608,32 +629,18 @@ with analyze_tab:
             analysis_df = pd.concat(frames, ignore_index=True)
 
     if analysis_df is not None:
-            st.success("Saved run loaded.")
-            cols = st.columns(3)
-            cols[0].metric("Rows", len(analysis_df))
-            if "lookup_query" in analysis_df.columns:
-                cols[1].metric("Lookup queries", analysis_df["lookup_query"].nunique())
-            if "type" in analysis_df.columns:
-                cols[2].metric("Distinct types", analysis_df["type"].nunique())
+        serp_col = "serpapi_results"
+        serp_data = None
+        if serp_col in analysis_df.columns:
+            def parse_serp(value):
+                if isinstance(value, str) and value.strip():
+                    try:
+                        return json.loads(value)
+                    except json.JSONDecodeError:
+                        return value
+                return value
 
-            st.dataframe(
-                analysis_df,
-                use_container_width=True,
-                height=(min(len(analysis_df), 25) + 1) * 35 + 3
-            )
-
-            serp_col = "serpapi_results"
-            serp_data = None
-            if serp_col in analysis_df.columns:
-                def parse_serp(value):
-                    if isinstance(value, str) and value.strip():
-                        try:
-                            return json.loads(value)
-                        except json.JSONDecodeError:
-                            return value
-                    return value
-
-                serp_data = analysis_df[serp_col].apply(parse_serp)
+            serp_data = analysis_df[serp_col].apply(parse_serp)
 
             all_reference_rows = []
             if serp_data is not None and "query" in analysis_df.columns:
@@ -657,6 +664,114 @@ with analyze_tab:
                                         "source": ref.get("source"),
                                         "snippet": ref.get("snippet")
                                     })
+
+            if all_reference_rows:
+                st.markdown("---")
+                st.subheader("AI Overview References (all queries)")
+                filter_options = sorted({row["lookup_query"] for row in all_reference_rows if row.get("lookup_query")})
+                selected_originals = st.multiselect(
+                    "Filter by original query",
+                    filter_options,
+                    default=filter_options,
+                    key="analysis_original_filter"
+                )
+                all_ref_df = pd.DataFrame(all_reference_rows)
+                if filter_options:
+                    if selected_originals:
+                        all_ref_df = all_ref_df[all_ref_df["lookup_query"].isin(selected_originals)]
+                    else:
+                        all_ref_df = all_ref_df.iloc[0:0]
+                        st.info("Select at least one original query to view references.")
+                original_entries = all_ref_df[all_ref_df["type"] == "original_lookup"] if "type" in all_ref_df.columns else pd.DataFrame()
+                if not original_entries.empty:
+                    originals = sorted({val for val in (original_entries["lookup_query"].dropna().tolist() + original_entries["query"].dropna().tolist()) if val})
+                    if originals:
+                        st.markdown("**Original queries:** " + ", ".join(f"`{q}`" for q in originals))
+
+                all_ref_df = all_ref_df.copy()
+                if "type" in all_ref_df.columns and not all_ref_df["type"].isna().all():
+                    all_ref_df["__is_original_lookup"] = all_ref_df["type"] == "original_lookup"
+                    all_ref_df = all_ref_df.sort_values(by="__is_original_lookup", ascending=False).drop(columns="__is_original_lookup")
+
+                if not all_ref_df.empty:
+                    display_cols = [col for col in all_ref_df.columns if col not in {"title", "snippet", "lookup_query", "type"}]
+                    if "lookup_query" in all_ref_df.columns:
+                        display_cols.append("lookup_query")
+                    st.dataframe(all_ref_df[display_cols], use_container_width=True)
+                else:
+                    st.info("No references to display. Adjust the filter to include at least one original query.")
+
+                source_counts = None
+                if "source" in all_ref_df.columns and not all_ref_df.empty:
+                    source_counts = all_ref_df["source"].value_counts().reset_index()
+                    source_counts.columns = ["company", "count"]
+                    st.subheader("References by source")
+                    st.dataframe(source_counts, use_container_width=True)
+
+                link_cols = [col for col in ["lookup_query", "query", "source", "link"] if col in all_ref_df.columns]
+                links_df = None
+                if not all_ref_df.empty and link_cols:
+                    links_df = all_ref_df[link_cols].drop_duplicates()
+                    links_df = links_df.rename(columns={
+                        "lookup_query": "original_query",
+                        "query": "fanout_query",
+                        "source": "company",
+                        "link": "link"
+                    })
+                    st.subheader("Source links by query")
+                    st.dataframe(links_df, use_container_width=True)
+
+                if gs_creds_text and gs_spreadsheet_id and not all_ref_df.empty:
+                    if st.button("Sync to Google Sheets", key="sync_ai_overview_refs"):
+                        try:
+                            sync_to_google_sheets(
+                                gs_creds_text,
+                                gs_spreadsheet_id,
+                                {
+                                    gs_refs_sheet: source_counts,
+                                    gs_links_sheet: links_df
+                                }
+                            )
+                            st.success("Synced references to Google Sheets.")
+                        except Exception as exc:
+                            st.error(f"Google Sheets sync failed: {exc}")
+                elif not all_ref_df.empty:
+                    st.info("Provide Google Sheets credentials in the sidebar to enable sync.")
+
+            if "type" in analysis_df.columns:
+                st.markdown("---")
+                st.subheader("Query type breakdown")
+                type_counts = analysis_df["type"].value_counts().reset_index()
+                type_counts.columns = ["type", "count"]
+                st.bar_chart(type_counts.set_index("type"))
+                st.subheader("Original query filter for type breakdown")
+                if "lookup_query" in analysis_df.columns:
+                    orig_options = sorted(analysis_df["lookup_query"].dropna().unique().tolist())
+                    selected_origins = st.multiselect(
+                        "Select original queries",
+                        orig_options,
+                        default=orig_options,
+                        key="analysis_type_filter"
+                    )
+                    if selected_origins:
+                        filtered = analysis_df[analysis_df["lookup_query"].isin(selected_origins)]
+                        type_counts_filtered = filtered["type"].value_counts().reset_index()
+                        type_counts_filtered.columns = ["type", "count"]
+                        st.bar_chart(type_counts_filtered.set_index("type"))
+
+            st.success("Saved run loaded.")
+            cols = st.columns(3)
+            cols[0].metric("Rows", len(analysis_df))
+            if "lookup_query" in analysis_df.columns:
+                cols[1].metric("Lookup queries", analysis_df["lookup_query"].nunique())
+            if "type" in analysis_df.columns:
+                cols[2].metric("Distinct types", analysis_df["type"].nunique())
+
+            st.dataframe(
+                analysis_df,
+                use_container_width=True,
+                height=(min(len(analysis_df), 25) + 1) * 35 + 3
+            )
 
             if "query" in analysis_df.columns and serp_data is not None:
                 st.markdown("---")
@@ -685,116 +800,11 @@ with analyze_tab:
                                     "title": ref.get("title"),
                                     "link": ref.get("link"),
                                     "source": ref.get("source"),
-                                "snippet": ref.get("snippet"),
-                            })
+                                    "snippet": ref.get("snippet"),
+                                })
                         if ref_rows:
                             with st.expander("AI Overview References"):
                                 ref_df = pd.DataFrame(ref_rows)
                                 st.dataframe(ref_df, use_container_width=True)
                 else:
                     st.info("No AI overview available.")
-
-            if all_reference_rows:
-                st.markdown("---")
-                st.subheader("AI Overview References (all queries)")
-                filter_options = sorted({row["lookup_query"] for row in all_reference_rows if row.get("lookup_query")})
-                selected_originals = st.multiselect(
-                    "Filter by original query",
-                    filter_options,
-                    default=filter_options,
-                    key="analysis_original_filter"
-                )
-                all_ref_df = pd.DataFrame(all_reference_rows)
-                if filter_options:
-                    if selected_originals:
-                        all_ref_df = all_ref_df[all_ref_df["lookup_query"].isin(selected_originals)]
-                    else:
-                        all_ref_df = all_ref_df.iloc[0:0]
-                        st.info("Select at least one original query to view references.")
-                original_entries = all_ref_df[all_ref_df["type"] == "original_lookup"] if "type" in all_ref_df.columns else pd.DataFrame()
-                if not original_entries.empty:
-                    originals = sorted({val for val in (original_entries["lookup_query"].dropna().tolist() + original_entries["query"].dropna().tolist()) if val})
-                    if originals:
-                        st.markdown("**Original queries:** " + ", ".join(f"`{q}`" for q in originals))
-
-                reference_store = st.session_state.reference_enrichments
-                all_ref_df = all_ref_df.copy()
-                all_ref_df["ref_key"] = all_ref_df.apply(build_reference_key, axis=1)
-                all_ref_df["contact_info"] = all_ref_df["ref_key"].apply(lambda key: reference_store.get(key, ""))
-                all_ref_df["fetch_contact"] = False
-
-                if "type" in all_ref_df.columns and not all_ref_df["type"].isna().all():
-                    all_ref_df["__is_original_lookup"] = all_ref_df["type"] == "original_lookup"
-                    all_ref_df = all_ref_df.sort_values(by="__is_original_lookup", ascending=False).drop(columns="__is_original_lookup")
-
-                if not all_ref_df.empty:
-                    column_order = [
-                        "fetch_contact",
-                        "contact_info",
-                        "lookup_query",
-                        "query",
-                        "type",
-                        "title",
-                        "source",
-                        "link",
-                        "snippet"
-                    ]
-                    column_order = [c for c in column_order if c in all_ref_df.columns]
-
-                    editor_df = st.data_editor(
-                        all_ref_df,
-                        column_order=column_order,
-                        hide_index=True,
-                        column_config={
-                            "fetch_contact": st.column_config.CheckboxColumn(
-                                "Fetch info",
-                                help="Check to fetch/update contact info for this reference."
-                            ),
-                            "contact_info": st.column_config.TextColumn("Contact info", disabled=True),
-                            "link": st.column_config.LinkColumn("Link", display_text="Open")
-                        },
-                        key="ai_overview_refs_editor",
-                        use_container_width=True,
-                        disabled=["contact_info"]
-                    )
-
-                    triggered = editor_df.loc[editor_df["fetch_contact"], "ref_key"].tolist()
-                    if triggered:
-                        refresh_needed = False
-                        for ref_key in triggered:
-                            row = all_ref_df[all_ref_df["ref_key"] == ref_key].iloc[0].to_dict()
-                            info = fetch_reference_contact_info(row)
-                            reference_store[ref_key] = info
-                            refresh_needed = True
-                        st.session_state.reference_enrichments = reference_store
-                        if refresh_needed:
-                            st.rerun()
-                else:
-                    st.info("No references to display. Adjust the filter to include at least one original query.")
-
-                if "source" in all_ref_df.columns:
-                    source_counts = all_ref_df["source"].value_counts().reset_index()
-                    source_counts.columns = ["source", "count"]
-                    st.subheader("References by source")
-                    st.dataframe(source_counts, use_container_width=True)
-
-            if "type" in analysis_df.columns:
-                st.markdown("---")
-                st.subheader("Query type breakdown")
-                type_counts = analysis_df["type"].value_counts().reset_index()
-                type_counts.columns = ["type", "count"]
-                st.bar_chart(type_counts.set_index("type"))
-                st.subheader("Original query filter for type breakdown")
-                if "lookup_query" in analysis_df.columns:
-                    orig_options = sorted(analysis_df["lookup_query"].dropna().unique().tolist())
-                    selected_origins = st.multiselect(
-                        "Select original queries",
-                        orig_options,
-                        default=orig_options,
-                        key="analysis_type_filter"
-                    )
-                    if selected_origins:
-                        filtered = analysis_df[analysis_df["lookup_query"].isin(selected_origins)]
-                        type_counts_filtered = filtered["type"].value_counts().reset_index()
-                        type_counts_filtered.columns = ["type", "count"]
-                        st.bar_chart(type_counts_filtered.set_index("type"))
