@@ -1,6 +1,6 @@
 import json
+import traceback
 from datetime import datetime
-import hashlib
 import gspread
 
 import google.generativeai as genai
@@ -667,7 +667,7 @@ with analyze_tab:
 
             if all_reference_rows:
                 st.markdown("---")
-                st.subheader("AI Overview References (all queries)")
+                st.header("AI Overview References (all queries)")
                 filter_options = sorted({row["lookup_query"] for row in all_reference_rows if row.get("lookup_query")})
                 selected_originals = st.multiselect(
                     "Filter by original query",
@@ -697,7 +697,8 @@ with analyze_tab:
                     display_cols = [col for col in all_ref_df.columns if col not in {"title", "snippet", "lookup_query", "type"}]
                     if "lookup_query" in all_ref_df.columns:
                         display_cols.append("lookup_query")
-                    st.dataframe(all_ref_df[display_cols], use_container_width=True)
+                    # Don't need this for now
+                    # st.dataframe(all_ref_df[display_cols], use_container_width=True)
                 else:
                     st.info("No references to display. Adjust the filter to include at least one original query.")
 
@@ -733,8 +734,10 @@ with analyze_tab:
                                 }
                             )
                             st.success("Synced references to Google Sheets.")
-                        except Exception as exc:
-                            st.error(f"Google Sheets sync failed: {exc}")
+                        except Exception:
+                            error_details = traceback.format_exc()
+                            print(error_details)
+                            st.error(f"Google Sheets sync failed:\n```\n{error_details}\n```")
                 elif not all_ref_df.empty:
                     st.info("Provide Google Sheets credentials in the sidebar to enable sync.")
 
