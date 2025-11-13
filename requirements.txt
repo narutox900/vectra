@@ -5,4 +5,5 @@ openai
 watchdog
 google-search-results
 gspread
+beautifulsoup4
 requests
