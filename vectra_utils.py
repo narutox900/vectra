@@ -75,7 +75,7 @@ def get_page_text(url, fallback=""):
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
         paragraphs = [p.get_text(" ", strip=True) for p in soup.find_all(["p", "h1", "h2", "h3"]) if p.get_text(strip=True)]
-        text = "\n".join(paragraphs[:40])
+        text = "\n".join(paragraphs)
     except Exception:
         text = ""
     if not text:

@@ -23,12 +23,11 @@ except ImportError:  # SerpAPI is optional
     GoogleSearch = None
 
 # App config
-st.set_page_config(page_title="Vectra", layout="wide")
-st.title("🔍 Vectra: Query Fan-Out Simulator for AI Surfaces")
+st.set_page_config(page_title="🔍 Vectra", layout="wide")
+st.title("🔍 Vectra: Query Fan-Out Simulator")
 
 # Sidebar: API key input and query
 st.sidebar.header("Configuration")
-run_clicked = st.sidebar.button("Run Fan-Out 🚀")
 provider = st.sidebar.radio("AI Provider", ["Gemini", "OpenAI"])
 
 if provider == "Gemini":
@@ -67,6 +66,8 @@ else:  # OpenAI
     model_name = "gpt-4o"  # Using GPT-4o as default, can be changed
     model = None
     ai_client = openai.OpenAI(api_key=api_key) if not api_key_missing else None
+
+run_clicked = st.sidebar.button("Run Fan-Out 🚀")
 
 # Integrations
 st.sidebar.markdown("---")
@@ -462,11 +463,46 @@ with run_tab:
                 df = df[existing + others]
 
                 df_display = df.copy()
+                hidden_cols = {
+                    "run_id",
+                    "run_timestamp",
+                    "provider",
+                    "mode",
+                    "input_mode",
+                    "routing_format",
+                    "format_reason",
+                    "serpapi_enabled",
+                    "serpapi_location",
+                    "serpapi_domain",
+                    "serpapi_gl",
+                    "serpapi_hl",
+                }
+                df_display = df_display[[c for c in df_display.columns if c not in hidden_cols]]
+                rename_map = {}
+                if "lookup_query" in df_display.columns:
+                    rename_map["lookup_query"] = "Base Query"
+                if "query" in df_display.columns:
+                    rename_map["query"] = "Fan-out Query"
+                df_display = df_display.rename(columns=rename_map)
                 if fetch_serp_results and serpapi_key and "serpapi_results" in df_display.columns:
                     df_display["serpapi_results"] = df_display["serpapi_results"].fillna("")
+                column_config = {}
+                if "Base Query" in df_display.columns:
+                    column_config["Base Query"] = st.column_config.Column(
+                        "Base Query", width="200px"
+                    )
+                if "Fan-out Query" in df_display.columns:
+                    column_config["Fan-out Query"] = st.column_config.Column(
+                        "Fan-out Query", width="200px"
+                    )
 
                 st.subheader("📊 Synthetic Queries (with routing format)")
-                st.dataframe(df_display, use_container_width=True, height=(min(len(df_display), 20) + 1) * 35 + 3)
+                st.dataframe(
+                    df_display,
+                    use_container_width=True,
+                    height=(min(len(df_display), 20) + 1) * 35 + 3,
+                    column_config=column_config if column_config else None,
+                )
 
                 csv = df_display.to_csv(index=False).encode("utf-8")
                 csv_name = f"vectra_output_bulk_with_routing_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
@@ -624,9 +660,10 @@ with analyze_tab:
         references_df = extract_references_from_df(analysis_df)
         st.session_state.analysis_references = references_df
 
+        # Check for all queries loaded
         if not references_df.empty:
             st.markdown("---")
-            st.header("AI Overview References (all queries)")
+            st.header("AI Overview Citation Analysis")
             filter_options = sorted({val for val in references_df["lookup_query"].dropna().unique()})
             selected_originals = st.multiselect(
                 "Filter by original query",
@@ -648,19 +685,30 @@ with analyze_tab:
                     st.markdown("**Original queries:** " + ", ".join(f"`{q}`" for q in originals))
 
             display_cols = [col for col in filtered_refs.columns if col not in {"title", "snippet", "lookup_query", "type"}]
+            include_lookup = False
             if "lookup_query" in filtered_refs.columns:
+                include_lookup = True
                 display_cols.append("lookup_query")
             if not filtered_refs.empty:
-                st.dataframe(filtered_refs[display_cols], use_container_width=True)
+                display_df = filtered_refs[display_cols].copy()
+                rename_map = {col: (col.replace("_", " ").title() if col != "query" else "Fan-out Query") for col in display_cols}
+                if include_lookup:
+                    rename_map["lookup_query"] = "Base Query"
+                display_df = display_df.rename(columns=rename_map)
+                st.dataframe(display_df, use_container_width=True)
             else:
                 st.info("No references to display. Adjust the filter to include at least one original query.")
 
             source_counts = None
             if "source" in filtered_refs.columns and not filtered_refs.empty:
                 source_counts = filtered_refs["source"].value_counts().reset_index()
-                source_counts.columns = ["company", "count"]
-                st.subheader("References by source")
-                st.dataframe(source_counts, use_container_width=True)
+                source_counts.columns = ["Company", "Count"]
+                source_counts["Count"] = source_counts["Count"].astype(str)
+                st.subheader("Most Cited Sources")
+                st.dataframe(
+                    source_counts.style.set_properties(subset=["Count"], **{"text-align": "left"}),
+                    use_container_width=True
+                )
 
             link_cols = [col for col in ["lookup_query", "query", "source", "link"] if col in filtered_refs.columns]
             links_df = None
@@ -672,8 +720,9 @@ with analyze_tab:
                     "source": "company",
                     "link": "link"
                 })
-                st.subheader("Source links by query")
-                st.dataframe(links_df, use_container_width=True)
+                # not needed for now
+                # st.subheader("Source links by query")
+                # st.dataframe(links_df, use_container_width=True)
 
             if gs_creds_text and gs_spreadsheet_id and not filtered_refs.empty:
                 if st.button("Sync to Google Sheets", key="sync_ai_overview_refs"):
@@ -692,26 +741,26 @@ with analyze_tab:
             elif not filtered_refs.empty:
                 st.info("Provide Google Sheets credentials in the sidebar to enable sync.")
 
-        if "type" in analysis_df.columns:
-            st.markdown("---")
-            st.subheader("Query type breakdown")
-            type_counts = analysis_df["type"].value_counts().reset_index()
-            type_counts.columns = ["type", "count"]
-            st.bar_chart(type_counts.set_index("type"))
-            st.subheader("Original query filter for type breakdown")
-            if "lookup_query" in analysis_df.columns:
-                orig_options = sorted(analysis_df["lookup_query"].dropna().unique().tolist())
-                selected_origins = st.multiselect(
-                    "Select original queries",
-                    orig_options,
-                    default=orig_options,
-                    key="analysis_type_filter"
-                )
-                if selected_origins:
-                    filtered = analysis_df[analysis_df["lookup_query"].isin(selected_origins)]
-                    type_counts_filtered = filtered["type"].value_counts().reset_index()
-                    type_counts_filtered.columns = ["type", "count"]
-                    st.bar_chart(type_counts_filtered.set_index("type"))
+        # if "type" in analysis_df.columns:
+        #     st.markdown("---")
+        #     st.subheader("Query type breakdown")
+        #     type_counts = analysis_df["type"].value_counts().reset_index()
+        #     type_counts.columns = ["type", "count"]
+        #     st.bar_chart(type_counts.set_index("type"))
+        #     st.subheader("Original query filter for type breakdown")
+        #     if "lookup_query" in analysis_df.columns:
+        #         orig_options = sorted(analysis_df["lookup_query"].dropna().unique().tolist())
+        #         selected_origins = st.multiselect(
+        #             "Select original queries",
+        #             orig_options,
+        #             default=orig_options,
+        #             key="analysis_type_filter"
+        #         )
+        #         if selected_origins:
+        #             filtered = analysis_df[analysis_df["lookup_query"].isin(selected_origins)]
+        #             type_counts_filtered = filtered["type"].value_counts().reset_index()
+        #             type_counts_filtered.columns = ["type", "count"]
+        #             st.bar_chart(type_counts_filtered.set_index("type"))
 
         st.success("Saved run loaded.")
         cols = st.columns(3)
@@ -827,10 +876,69 @@ with embedding_tab:
                         st.dataframe(results_df, use_container_width=True)
                         st.subheader("Similarity distribution")
                         st.bar_chart(results_df.set_index("source")["similarity"])
-                        csv_bytes = results_df.to_csv(index=False).encode("utf-8")
-                        st.download_button(
-                            "Download similarity table",
-                            data=csv_bytes,
-                            file_name="embeddings_similarity.csv",
-                            mime="text/csv"
+                    csv_bytes = results_df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "Download similarity table",
+                        data=csv_bytes,
+                        file_name="embeddings_similarity.csv",
+                        mime="text/csv"
+                    )
+
+        st.markdown("---")
+        st.subheader("Compare fan-out queries to websites")
+        fanout_options = subset["query"].dropna().unique().tolist()
+        selected_fanouts = st.multiselect(
+            "Select fan-out queries to compare",
+            fanout_options,
+            default=fanout_options[: min(3, len(fanout_options))]
+        )
+        website_urls = st.text_area(
+            "Website URLs (one per line)",
+            placeholder="https://example.com/article-1\nhttps://example.com/article-2",
+            height=100
+        )
+        compare = st.button("Compare against websites")
+
+        if compare:
+            if not embedding_key:
+                st.error("Provide an OpenAI API key to generate embeddings.")
+            elif not selected_fanouts:
+                st.error("Select at least one fan-out query.")
+            else:
+                urls = [line.strip() for line in website_urls.splitlines() if line.strip()]
+                if not urls:
+                    st.error("Enter at least one website URL.")
+                else:
+                    site_texts = [get_page_text(url, fallback="") for url in urls]
+                    print(site_texts)
+                    with st.spinner("Embedding queries & websites…"):
+                        try:
+                            embeddings = embed_texts(selected_fanouts + site_texts, embedding_key)
+                        except Exception as exc:
+                            st.error(f"Embedding API error: {exc}")
+                            embeddings = []
+                    if embeddings and len(embeddings) == len(selected_fanouts) + len(site_texts):
+                        query_vecs = embeddings[: len(selected_fanouts)]
+                        site_vecs = embeddings[len(selected_fanouts) :]
+                        rows = []
+                        for query, qvec in zip(selected_fanouts, query_vecs):
+                            for url, svar, site_vec in zip(urls, site_texts, site_vecs):
+                                score = cosine_similarity(qvec, site_vec)
+                                rows.append(
+                                    {
+                                        "Fan-out Query": query,
+                                        "Website": url,
+                                        "Similarity": score,
+                                        "Excerpt": svar[:200] + ("…" if len(svar) > 200 else ""),
+                                    }
+                                )
+                        results_df = pd.DataFrame(rows).sort_values(["Website", "Similarity"], ascending=[True, False])
+                        st.markdown("### Similarity table")
+                        st.dataframe(results_df, use_container_width=True)
+                        best_hits = (
+                            results_df.groupby("Website", as_index=False)
+                            .first()
+                            .sort_values("Similarity", ascending=False)
                         )
+                        st.markdown("### Best match per website")
+                        st.dataframe(best_hits, use_container_width=True)
