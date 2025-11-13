@@ -736,6 +736,8 @@ with analyze_tab:
                             }
                         )
                         st.success("Synced references to Google Sheets.")
+                        sheet_url = f"https://docs.google.com/spreadsheets/d/{gs_spreadsheet_id}"
+                        st.markdown(f"[Open synced sheet]({sheet_url})")
                     except Exception as exc:
                         st.error(f"Google Sheets sync failed: {exc}")
             elif not filtered_refs.empty:
@@ -831,15 +833,20 @@ with embedding_tab:
         st.session_state.embedding_api_key = embedding_key
 
         lookup_options = sorted(references_df["lookup_query"].dropna().unique().tolist())
-        selected_lookup = st.selectbox("Pick an original query", lookup_options)
-        subset = references_df[references_df["lookup_query"] == selected_lookup]
+        selected_lookup = st.multiselect(
+            "Pick original base query(ies)",
+            lookup_options,
+            default=lookup_options[: min(2, len(lookup_options))]
+        )
+        subset = references_df[references_df["lookup_query"].isin(selected_lookup)]
         if subset.empty:
-            st.info("No references recorded for that lookup.")
+            st.info("No references recorded for the selected lookup(s).")
         else:
             st.markdown("### References for embedding comparison")
             st.dataframe(subset[["source", "link", "snippet"]], use_container_width=True)
 
-            query_text = st.text_area("Query text (editable)", value=selected_lookup, height=80)
+            query_text_default = " | ".join(selected_lookup)
+            query_text = st.text_area("Query text (editable)", value=query_text_default, height=80)
             top_n = st.slider("How many references to include", min_value=1, max_value=min(20, len(subset)), value=min(5, len(subset)))
             compute = st.button("Compute similarity")
             if compute:
