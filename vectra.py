@@ -505,8 +505,8 @@ with run_tab:
                 )
 
                 csv = df_display.to_csv(index=False).encode("utf-8")
-                csv_name = f"vectra_output_bulk_with_routing_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-                st.download_button("📥 Download CSV", data=csv, file_name=csv_name, mime="text/csv")
+                # csv_name = f"vectra_output_bulk_with_routing_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                # st.download_button("📥 Download CSV", data=csv, file_name=csv_name, mime="text/csv")
 
                 st.session_state.last_runs.append({
                     "timestamp": run_timestamp,
